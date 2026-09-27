@@ -1,15 +1,15 @@
 import { connect } from "cloudflare:sockets";
 
 // ============================================
-// ENV VARIABLES
+// ENV VARIABLES (ပတ်ဝန်းကျင် သတ်မှတ်ချက်များ)
 // ============================================
-var userID = "";                    // VLESS: UUID (optional if only TROJAN)
-var trojanPass = "";              // TROJAN: password (optional if only VLESS)
-var proxyIP = "blacknight.abrdns.com";
-var githubProxyURL = "";
+var userID = "";                    // VLESS: UUID 
+var trojanPass = "";              // TROJAN: password 
+var proxyIP = "blacknight.abrdns.com"; // ပုံသေသုံးမည့် Proxy IP (သို့မဟုတ် Domain)
 
-// DoH Providers (3 URLs with failover)
-var dohURLs = ["https://dns.alidns.com/dns-query",
+// DoH Providers (DNS ဖြေရှင်းပေးရန် လမ်းကြောင်းများ)
+var dohURLs = [
+    "https://dns.alidns.com/dns-query",
     "https://cloudflare-dns.com/dns-query",
     "https://dns.google/dns-query",
     "https://dns.quad9.net/dns-query"
@@ -21,7 +21,7 @@ function isValidUUID(uuid) {
 }
 
 // ============================================
-// SHA224 Pure JS (Cloudflare Workers compatible)
+// SHA224 Pure JS (Trojan အတွက်)
 // ============================================
 function sha224(str) {
     function rightRotate(value, amount) {
@@ -108,26 +108,6 @@ function hashTrojanPassword(password) {
 }
 
 // ============================================
-// ProxyIP Fetch
-// ============================================
-async function getDynamicProxyIP(defaultProxy, rawUrl) {
-    if (!rawUrl || rawUrl.includes("YOUR_USERNAME")) return defaultProxy;
-    try {
-        const response = await fetch(rawUrl, { cf: { cacheTtl: 300, cacheEverything: true } });
-        if (response.ok) {
-            const text = await response.text();
-            const ipList = text.split('\n')
-                .map(line => line.trim())
-                .filter(line => line.length > 0 && !line.startsWith('#'));
-            if (ipList.length > 0) return ipList[Math.floor(Math.random() * ipList.length)];
-        }
-    } catch (err) {
-        console.error("GitHub ProxyIP Fetch Error:", err);
-    }
-    return defaultProxy;
-}
-
-// ============================================
 // Main Worker
 // ============================================
 var worker_default = {
@@ -135,7 +115,6 @@ var worker_default = {
         userID = env.UUID || env.uuid || userID;
         trojanPass = env.TROJAN_PASS || env.trojan_pass || trojanPass;
         proxyIP = env.PROXYIP || env.proxyip || env.PROXY_IP || proxyIP;
-        githubProxyURL = env.PROXY_LIST_URL || githubProxyURL;
         if (env.DNS_RESOLVER_URL) {
             const urls = env.DNS_RESOLVER_URL;
             dohURLs = Array.isArray(urls) ? urls : [urls];
@@ -167,7 +146,27 @@ h1{color:#f87171;} code{background:#334155;padding:2px 8px;border-radius:4px;}</
         if (upgradeHeader === "websocket") {
             return await proxyOverWSHandler(request);
         }
-        return new Response(getGalaxyPage(), {
+
+        // speed.cloudflare.com/locations မှ အချက်အလက်များကို ဆွဲယူပြီး UI တွင် ပြသရန်
+        const cfInfo = request.cf || {};
+        const colo = cfInfo.colo || "UNKNOWN";
+        let locationText = `Colo: ${colo}`;
+
+        try {
+            const locResp = await fetch("https://speed.cloudflare.com/locations", { 
+                cf: { cacheTtl: 86400, cacheEverything: true } 
+            });
+            if (locResp.ok) {
+                const locData = await locResp.json();
+                if (locData[colo]) {
+                    locationText = `${locData[colo].city}, ${locData[colo].country} (${colo})`;
+                }
+            }
+        } catch (err) {
+            console.error("Location fetch error:", err);
+        }
+
+        return new Response(getGalaxyPage(locationText), {
             status: 200,
             headers: { "Content-Type": "text/html; charset=utf-8" }
         });
@@ -208,7 +207,6 @@ async function proxyOverWSHandler(request) {
             let result = null;
             let protocolType = "unknown";
 
-            // Try VLESS first (version byte == 0x00)
             if (firstByte === 0x00 && isValidUUID(userID)) {
                 try {
                     result = processVlessHeader(chunk, userID);
@@ -218,7 +216,6 @@ async function proxyOverWSHandler(request) {
                 }
             }
 
-            // Fallback to TROJAN
             if ((!result || result.hasError) && trojanPass) {
                 result = processTrojanHeader(chunk, trojanPass);
                 if (result && !result.hasError) protocolType = "trojan";
@@ -265,7 +262,7 @@ async function proxyOverWSHandler(request) {
 }
 
 // ============================================
-// TCP Outbound
+// TCP Outbound (ProxyIP သုံးစွဲရန် ပြင်ဆင်ထားသည်)
 // ============================================
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, log) {
     async function connectAndWrite(address, port) {
@@ -279,8 +276,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     }
 
     async function retry() {
-        const activeProxy = await getDynamicProxyIP(proxyIP, githubProxyURL);
-        const target = activeProxy || addressRemote;
+        const target = proxyIP || addressRemote;
         log(`Retrying connection via ProxyIP: ${target}`);
         const tcpSocket = await connectAndWrite(target, portRemote);
         tcpSocket.closed.catch((error) => {
@@ -465,8 +461,6 @@ function processTrojanHeader(trojanBuffer, password) {
     }
 
     const rawDataIndex = crlfIndex + 2;
-    console.log(`TROJAN: target ${addressValue}:${portRemote}, UDP: ${command === 0x03}`);
-
     return {
         hasError: false,
         addressRemote: addressValue,
@@ -554,7 +548,7 @@ function safeCloseWebSocket(socket) {
 }
 
 // ============================================
-// UDP / DoH Handler (Multi-URL Failover)
+// UDP / DoH Handler
 // ============================================
 async function handleUDPOutBound(webSocket, responseHeader, log) {
     let isHeaderSent = false;
@@ -574,7 +568,6 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
     transformStream.readable.pipeTo(new WritableStream({
         async write(chunk) {
             let lastError = null;
-
             for (const url of dohURLs) {
                 try {
                     const resp = await fetch(url, {
@@ -587,7 +580,6 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
                     const udpSizeBuffer = new Uint8Array([udpSize >> 8 & 255, udpSize & 255]);
 
                     if (webSocket.readyState === 1) {
-                        log(`DoH success via ${url}, length: ${udpSize}`);
                         if (isHeaderSent) {
                             webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
                         } else {
@@ -598,11 +590,8 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
                     }
                 } catch (err) {
                     lastError = err;
-                    log(`DoH failed: ${url}, error: ${err.message}`);
                 }
             }
-
-            log("All DoH providers failed: " + (lastError ? lastError.message : "unknown"));
         }
     })).catch((error) => {
         log("DNS UDP error" + error);
@@ -613,9 +602,9 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
 }
 
 // ============================================
-// Galaxy UI
+// Galaxy UI (Location Text လက်ခံပြသရန်)
 // ============================================
-function getGalaxyPage() {
+function getGalaxyPage(locationText) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -663,11 +652,11 @@ function getGalaxyPage() {
       padding: 35px 25px 25px 25px; border-radius: 4px;
     }
     .graphic-container {
-      position: relative; width: 230px; height: 230px;
+      position: relative; width: 200px; height: 200px;
       display: flex; justify-content: center; align-items: center;
     }
     .ring {
-      position: absolute; width: 240px; height: 75px;
+      position: absolute; width: 210px; height: 65px;
       border: 2px solid rgba(0, 230, 255, 0.85); border-radius: 50%;
       transform: rotate(-28deg);
       box-shadow: 0 0 15px rgba(0, 212, 255, 0.8), inset 0 0 15px rgba(0, 212, 255, 0.5);
@@ -683,23 +672,22 @@ function getGalaxyPage() {
       text-align: center; position: relative;
     }
     .title {
-      font-size: 34px; font-weight: 900; font-style: italic;
+      font-size: 28px; font-weight: 900; font-style: italic;
       color: #ffffff; letter-spacing: 2px; text-transform: uppercase;
       text-shadow: 0 0 12px rgba(255, 255, 255, 0.7); line-height: 1.1;
     }
     .subtitle {
-      font-size: 16px; font-weight: 600; color: #7b93a7;
-      letter-spacing: 5px; margin-top: 6px; text-transform: uppercase;
+      font-size: 14px; font-weight: 600; color: #7b93a7;
+      letter-spacing: 4px; margin-top: 4px; text-transform: uppercase;
     }
     .access-badge {
-      align-self: flex-end; margin-top: 15px; font-size: 20px;
+      margin-top: 12px; font-size: 16px;
       font-weight: 900; font-style: italic; color: #00e5ff;
-      text-transform: uppercase; text-align: right; letter-spacing: 1px; line-height: 1.1;
-      text-shadow: 0 0 15px rgba(0, 229, 255, 0.85); animation: statusPulse 2s infinite alternate;
+      text-transform: uppercase; text-align: center; letter-spacing: 1px; line-height: 1.2;
+      text-shadow: 0 0 15px rgba(0, 229, 255, 0.85);
     }
-    @keyframes statusPulse {
-      0% { opacity: 0.8; text-shadow: 0 0 8px rgba(0,229,255,0.5); }
-      100% { opacity: 1; text-shadow: 0 0 20px rgba(0,229,255,1); }
+    .location-tag {
+      font-size: 12px; color: #00ffcc; margin-top: 5px; font-weight: normal; letter-spacing: 0.5px;
     }
   </style>
 </head>
@@ -709,20 +697,21 @@ function getGalaxyPage() {
   <div class="card-frame">
     <div class="graphic-container">
       <div class="ring"></div>
-      <canvas id="nodeCanvas" width="230" height="230"></canvas>
+      <canvas id="nodeCanvas" width="200" height="200"></canvas>
     </div>
     <div class="content-bottom">
       <h1 class="title">GALAXY-TUNNEL</h1>
       <div class="subtitle">VLESS / TROJAN</div>
       <div class="access-badge">
-        GALAXY VPROXY<br>IS ACCESS
+        GALAXY VPROXY IS ACCESS
+        <div class="location-tag">📍 ${locationText}</div>
       </div>
     </div>
   </div>
   <script>
     const canvas = document.getElementById('nodeCanvas');
     const ctx = canvas.getContext('2d');
-    const numNodes = 32; const nodes = []; const radius = 75;
+    const numNodes = 28; const nodes = []; const radius = 65;
     let angleX = 0.004; let angleY = 0.007;
 
     for (let i = 0; i < numNodes; i++) {
@@ -763,7 +752,7 @@ function getGalaxyPage() {
       for (let i = 0; i < nodes.length; i++) {
         for (let j = i + 1; j < nodes.length; j++) {
           let dist = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y, nodes[i].z - nodes[j].z);
-          if (dist < 60) {
+          if (dist < 55) {
             ctx.beginPath();
             ctx.moveTo(nodes[i].x + cx, nodes[i].y + cy);
             ctx.lineTo(nodes[j].x + cx, nodes[j].y + cy);
@@ -773,11 +762,11 @@ function getGalaxyPage() {
       }
 
       nodes.forEach(node => {
-        let size = (node.z + radius) / (2 * radius) * 3 + 2;
+        let size = (node.z + radius) / (2 * radius) * 2.5 + 1.5;
         ctx.beginPath();
         ctx.arc(node.x + cx, node.y + cy, size, 0, Math.PI * 2);
         ctx.fillStyle = '#00f0ff';
-        ctx.shadowBlur = 8; ctx.shadowColor = '#00f0ff';
+        ctx.shadowBlur = 6; ctx.shadowColor = '#00f0ff';
         ctx.fill(); ctx.shadowBlur = 0;
       });
 
