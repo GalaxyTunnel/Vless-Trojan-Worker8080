@@ -5,12 +5,12 @@ import { connect } from "cloudflare:sockets";
 // ============================================
 var userID = "";                    // VLESS: UUID (optional if only TROJAN)
 var trojanPass = "";              // TROJAN: password (optional if only VLESS)
-var proxyIP = "cdn-b100.xn--b6gac.eu.org";
-var githubProxyURL = "https://galaxytunnel.github.io/PROXYIP.txt";
+var proxyIP = "blacknight.abrdns.com";
+var githubProxyURL = "";
 
 // DoH Providers (3 URLs with failover)
-var dohURLs = [
-    "https://2mms0p4zud.cloudflare-gateway.com/dns-query",
+var dohURLs = ["https://dns.alidns.com/dns-query",
+    "https://cloudflare-dns.com/dns-query",
     "https://dns.google/dns-query",
     "https://dns.quad9.net/dns-query"
 ];
